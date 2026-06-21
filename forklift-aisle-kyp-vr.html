@@ -139,7 +139,7 @@ window.addEventListener('error', function(e){
 function init(){
   scene = new THREE.Scene();
   scene.background = new THREE.Color(0x111418);
-  scene.fog = new THREE.Fog(0x111418, 15, 60);
+  scene.fog = new THREE.Fog(0x111418, 18, 70);
 
   camera = new THREE.PerspectiveCamera(75, window.innerWidth/window.innerHeight, 0.05, 100);
 
@@ -209,7 +209,7 @@ function onSessionEnded(){
 
 // ---------------- SCENE GEOMETRY ----------------
 let forkliftLeft, forkliftRight;
-const RACK_Z_SOUTH = -3.2, RACK_Z_NORTH = 3.2; // racks border the crossing gap (aisle along X, gap along Z is -2..2)
+const RACK_Z_SOUTH = -9.5, RACK_Z_NORTH = 9.5; // racks sit as a backdrop well clear of the player's walking path (z -8..8)
 
 function buildScene(){
   // lighting
