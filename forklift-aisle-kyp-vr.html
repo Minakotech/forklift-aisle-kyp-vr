@@ -1,0 +1,548 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Forklift Aisle Crossing — KYP VR Training</title>
+<style>
+  html,body{margin:0;height:100%;overflow:hidden;background:#000;font-family:Arial,Helvetica,sans-serif;}
+  #vrButton{
+    position:absolute;left:50%;bottom:24px;transform:translateX(-50%);
+    padding:12px 22px;border-radius:8px;border:1px solid #fff;color:#fff;
+    background:rgba(0,0,0,.6);font-size:16px;cursor:pointer;z-index:20;
+  }
+  #hud{
+    position:absolute;top:10px;left:10px;color:#fff;font-size:13px;
+    background:rgba(0,0,0,.5);padding:8px 12px;border-radius:6px;z-index:20;
+    max-width:340px;line-height:1.4;
+  }
+  #flash{
+    position:absolute;inset:0;background:#ff0000;opacity:0;pointer-events:none;
+    transition:opacity .08s linear;z-index:30;
+  }
+</style>
+</head>
+<body>
+<div id="hud">
+  <b>Forklift Aisle Crossing — KYP Training</b><br>
+  <span id="hudState">Loading…</span><br><br>
+  <i>Desktop test controls: Arrow Left/Right = turn head, 1/2/3 = point Left/Fwd/Right, Enter = trigger</i>
+</div>
+<div id="flash"></div>
+<button id="vrButton">Checking VR support…</button>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+<script>
+/* ----------------------------------------------------------------------
+   FORKLIFT AISLE CROSSING — KYP (Kiken Yochi) VR TRAINING SCENE
+   Single-file WebXR app. No external assets, no network calls at runtime
+   except loading three.js from CDN, and the audio is fully procedural.
+   ---------------------------------------------------------------------- */
+
+let scene, camera, renderer, rig;
+let controller0, controller1;
+let clock = new THREE.Clock();
+
+// ---- World layout ----
+// Aisle runs along world X axis (forklifts drive along X).
+// Player crosses along world Z axis, from south (z=-8) to north (z=+8).
+// Crossing line is at z=0. Player "left" = -X (west), "right" = +X (east).
+const START_Z = -8, CROSS_Z = 0, END_Z = 8;
+const WALK_SPEED = 1.6; // m/s
+
+// ---- State machine ----
+const STATE = {
+  APPROACH: 'APPROACH',
+  CHECK: 'CHECK',          // must look left & right
+  KYP: 'KYP',               // point-and-call left/forward/right
+  CROSS: 'CROSS',
+  SAFE: 'SAFE',
+  HIT: 'HIT'
+};
+let state = STATE.APPROACH;
+let stateTimer = 0;
+let lookedLeft = false, lookedRight = false;
+let kypStep = 0; // 0=left,1=forward,2=right,3=done
+const kypLabels = ['Point LEFT & pull trigger','Point FORWARD & pull trigger','Point RIGHT & pull trigger'];
+let attempts = 0;
+let lastHitSide = null;
+
+const CHECK_TIME_LIMIT = 9.0;
+const KYP_TIME_LIMIT = 10.0;
+const LOOK_THRESHOLD = THREE.MathUtils.degToRad(35);
+const POINT_THRESHOLD = THREE.MathUtils.degToRad(40);
+
+// ---- audio (procedural, no files needed) ----
+let actx;
+function ensureAudio(){ if(!actx) actx = new (window.AudioContext||window.webkitAudioContext)(); }
+function tone(freq, dur, type='sine', vol=0.25, delay=0){
+  ensureAudio();
+  const t0 = actx.currentTime + delay;
+  const osc = actx.createOscillator();
+  const gain = actx.createGain();
+  osc.type = type; osc.frequency.setValueAtTime(freq, t0);
+  gain.gain.setValueAtTime(0, t0);
+  gain.gain.linearRampToValueAtTime(vol, t0+0.02);
+  gain.gain.exponentialRampToValueAtTime(0.001, t0+dur);
+  osc.connect(gain); gain.connect(actx.destination);
+  osc.start(t0); osc.stop(t0+dur+0.05);
+}
+function hornBlast(){
+  tone(220,0.5,'sawtooth',0.3,0);
+  tone(220,0.5,'sawtooth',0.3,0.15);
+  tone(220,0.5,'sawtooth',0.3,0.30);
+}
+function engineRoar(){
+  ensureAudio();
+  const bufSize = actx.sampleRate * 0.8;
+  const buf = actx.createBuffer(1, bufSize, actx.sampleRate);
+  const data = buf.getChannelData(0);
+  for(let i=0;i<bufSize;i++) data[i] = (Math.random()*2-1) * (1 - i/bufSize);
+  const src = actx.createBufferSource(); src.buffer = buf;
+  const gain = actx.createGain(); gain.gain.setValueAtTime(0.5, actx.currentTime);
+  const filter = actx.createBiquadFilter(); filter.type='lowpass'; filter.frequency.value=400;
+  src.connect(filter); filter.connect(gain); gain.connect(actx.destination);
+  src.start();
+}
+function successChime(){ tone(523,0.2,'sine',0.2,0); tone(659,0.2,'sine',0.2,0.12); tone(784,0.35,'sine',0.25,0.24); }
+function clickTone(){ tone(880,0.08,'square',0.15,0); }
+
+// ---- haptics ----
+function pulseController(controller, intensity=1.0, duration=200){
+  const src = controller && controller.userData && controller.userData.inputSource;
+  const gp = src && src.gamepad;
+  if(gp && gp.hapticActuators && gp.hapticActuators[0]){
+    gp.hapticActuators[0].pulse(intensity, duration);
+  }
+}
+function pulseBoth(intensity,duration){ pulseController(controller0,intensity,duration); pulseController(controller1,intensity,duration); }
+
+// ---- screen flash / shake ----
+let flashEl = document.getElementById('flash');
+function flashRed(times=4){
+  let i=0;
+  const iv = setInterval(()=>{
+    flashEl.style.opacity = (i%2===0)?'0.55':'0';
+    i++;
+    if(i>times*2){ clearInterval(iv); flashEl.style.opacity='0'; }
+  }, 90);
+}
+let shakeTime = 0;
+
+init();
+
+function init(){
+  scene = new THREE.Scene();
+  scene.background = new THREE.Color(0x111418);
+  scene.fog = new THREE.Fog(0x111418, 15, 60);
+
+  camera = new THREE.PerspectiveCamera(75, window.innerWidth/window.innerHeight, 0.05, 100);
+
+  rig = new THREE.Group();
+  rig.add(camera);
+  rig.position.set(0,1.6, START_Z);
+  scene.add(rig);
+
+  renderer = new THREE.WebGLRenderer({ antialias:true });
+  renderer.setPixelRatio(window.devicePixelRatio);
+  renderer.setSize(window.innerWidth, window.innerHeight);
+  renderer.xr.enabled = true;
+  document.body.appendChild(renderer.domElement);
+
+  setupVRButton();
+  buildScene();
+  buildControllers();
+  buildHUDPanel();
+  setupDesktopFallback();
+
+  window.addEventListener('resize', onResize);
+  renderer.setAnimationLoop(animate);
+}
+
+function onResize(){
+  camera.aspect = window.innerWidth/window.innerHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(window.innerWidth, window.innerHeight);
+}
+
+// ---------------- VR BUTTON (minimal inline implementation) ----------------
+function setupVRButton(){
+  const btn = document.getElementById('vrButton');
+  if('xr' in navigator){
+    navigator.xr.isSessionSupported('immersive-vr').then(supported=>{
+      if(supported){
+        btn.textContent = 'Enter VR';
+        btn.onclick = onVRButtonClick;
+      } else {
+        btn.textContent = 'VR not supported on this browser';
+        btn.disabled = true;
+      }
+    });
+  } else {
+    btn.textContent = 'WebXR not available — desktop test mode only';
+  }
+}
+let currentSession = null;
+function onVRButtonClick(){
+  if(currentSession === null){
+    ensureAudio();
+    navigator.xr.requestSession('immersive-vr', { optionalFeatures:['local-floor','bounded-floor'] }).then(onSessionStarted);
+  } else {
+    currentSession.end();
+  }
+}
+function onSessionStarted(session){
+  session.addEventListener('end', onSessionEnded);
+  renderer.xr.setSession(session);
+  currentSession = session;
+  document.getElementById('vrButton').textContent = 'Exit VR';
+}
+function onSessionEnded(){
+  currentSession = null;
+  document.getElementById('vrButton').textContent = 'Enter VR';
+}
+
+// ---------------- SCENE GEOMETRY ----------------
+let forkliftLeft, forkliftRight;
+const RACK_Z_SOUTH = -3.2, RACK_Z_NORTH = 3.2; // racks border the crossing gap (aisle along X, gap along Z is -2..2)
+
+function buildScene(){
+  // lighting
+  scene.add(new THREE.AmbientLight(0x808890, 0.9));
+  const dir = new THREE.DirectionalLight(0xfff3e0, 0.8);
+  dir.position.set(10,20,10);
+  scene.add(dir);
+
+  // floor
+  const floorMat = new THREE.MeshStandardMaterial({ color:0xc9c2a9, roughness:0.85 });
+  const floor = new THREE.Mesh(new THREE.PlaneGeometry(120,120), floorMat);
+  floor.rotation.x = -Math.PI/2;
+  scene.add(floor);
+
+  // crossing line marking on floor
+  const lineMat = new THREE.MeshBasicMaterial({ color:0xffcc00 });
+  const line = new THREE.Mesh(new THREE.PlaneGeometry(6,0.15), lineMat);
+  line.rotation.x = -Math.PI/2;
+  line.position.set(0,0.01,0);
+  scene.add(line);
+
+  // racks running along X (east-west), one south wall one north wall, leaving a crossing gap in the middle
+  buildWarehouseWall(RACK_Z_SOUTH, -1);
+  buildWarehouseWall(RACK_Z_NORTH, 1);
+
+  // ceiling beams (simple)
+  for(let x=-30; x<=30; x+=6){
+    const beam = new THREE.Mesh(new THREE.BoxGeometry(0.3,0.3,40), new THREE.MeshStandardMaterial({color:0x333333}));
+    beam.position.set(x,6,0);
+    scene.add(beam);
+  }
+
+  // forklifts (start parked off to the sides, hidden until triggered)
+  forkliftLeft = buildForklift(0xdd3333);
+  forkliftLeft.position.set(-30, 0, 0);
+  forkliftLeft.userData.dir = 1; // moves toward +X (from west to east, i.e. arrives from player's left)
+  scene.add(forkliftLeft);
+
+  forkliftRight = buildForklift(0x3366dd);
+  forkliftRight.position.set(30, 0, 0);
+  forkliftRight.userData.dir = -1; // moves toward -X (arrives from player's right)
+  scene.add(forkliftRight);
+}
+
+function buildWarehouseWall(zPos, normalSign){
+  const group = new THREE.Group();
+  const frameMat = new THREE.MeshStandardMaterial({ color:0x2b3a2b, metalness:0.3, roughness:0.6 });
+  const boxColors = [0xd8cdb0, 0x2fa6a0, 0xc7b89a];
+
+  for(let x=-26; x<=26; x+=4){
+    // skip the crossing gap area near x small? Actually gap is along Z not X; wall runs full length along X.
+    // upright posts
+    const post = new THREE.Mesh(new THREE.BoxGeometry(0.15,5.5,0.15), frameMat);
+    post.position.set(x, 2.75, zPos + normalSign*0.3);
+    group.add(post);
+
+    // three shelf levels of boxes
+    for(let level=0; level<3; level++){
+      const y = 0.9 + level*1.7;
+      const boxMat = new THREE.MeshStandardMaterial({ color: boxColors[(level+ (x|0))%boxColors.length], roughness:0.9 });
+      const stack = new THREE.Mesh(new THREE.BoxGeometry(3.4,1.5,1.6), boxMat);
+      stack.position.set(x, y, zPos + normalSign*1.1);
+      group.add(stack);
+    }
+  }
+  scene.add(group);
+}
+
+function buildForklift(color){
+  const g = new THREE.Group();
+  const bodyMat = new THREE.MeshStandardMaterial({ color, roughness:0.5, metalness:0.4 });
+  const body = new THREE.Mesh(new THREE.BoxGeometry(1.6,1.0,2.4), bodyMat);
+  body.position.y = 0.7;
+  g.add(body);
+
+  const cage = new THREE.Mesh(new THREE.BoxGeometry(1.2,1.0,1.0), new THREE.MeshStandardMaterial({color:0x222222}));
+  cage.position.set(0,1.6,0.4);
+  g.add(cage);
+
+  const mast = new THREE.Mesh(new THREE.BoxGeometry(1.3,2.2,0.15), new THREE.MeshStandardMaterial({color:0x555555}));
+  mast.position.set(0,1.3,-1.3);
+  g.add(mast);
+
+  const forkMat = new THREE.MeshStandardMaterial({color:0x888888});
+  for(const ox of [-0.35,0.35]){
+    const fork = new THREE.Mesh(new THREE.BoxGeometry(0.12,0.08,1.1), forkMat);
+    fork.position.set(ox,0.3,-1.9);
+    g.add(fork);
+  }
+
+  const wheelMat = new THREE.MeshStandardMaterial({color:0x111111});
+  for(const [wx,wz] of [[-0.8,0.8],[0.8,0.8],[-0.8,-0.8],[0.8,-0.8]]){
+    const wheel = new THREE.Mesh(new THREE.CylinderGeometry(0.35,0.35,0.3,16), wheelMat);
+    wheel.rotation.z = Math.PI/2;
+    wheel.position.set(wx,0.35,wz);
+    g.add(wheel);
+  }
+
+  // beacon light
+  const beacon = new THREE.Mesh(new THREE.SphereGeometry(0.12,8,8), new THREE.MeshBasicMaterial({color:0xffaa00}));
+  beacon.position.set(0,2.0,0.4);
+  g.add(beacon);
+  g.userData.beacon = beacon;
+
+  return g;
+}
+
+// ---------------- CONTROLLERS ----------------
+function buildControllers(){
+  controller0 = renderer.xr.getController(0);
+  controller1 = renderer.xr.getController(1);
+  scene.add(controller0); scene.add(controller1);
+
+  const pointerGeo = new THREE.CylinderGeometry(0.01,0.01,0.4,6);
+  pointerGeo.rotateX(Math.PI/2);
+  pointerGeo.translate(0,0,-0.2);
+  const pointerMat = new THREE.MeshBasicMaterial({color:0x44ff88});
+  controller0.add(new THREE.Mesh(pointerGeo, pointerMat));
+  controller1.add(new THREE.Mesh(pointerGeo.clone(), pointerMat.clone()));
+
+  controller0.addEventListener('connected', e=>{ controller0.userData.inputSource = e.data; });
+  controller1.addEventListener('connected', e=>{ controller1.userData.inputSource = e.data; });
+
+  controller0.addEventListener('selectstart', ()=>onTrigger(controller0));
+  controller1.addEventListener('selectstart', ()=>onTrigger(controller1));
+}
+
+function getControllerForwardYaw(controller){
+  const q = new THREE.Quaternion();
+  controller.getWorldQuaternion(q);
+  const fwd = new THREE.Vector3(0,0,-1).applyQuaternion(q);
+  return Math.atan2(fwd.x, fwd.z); // same convention as head yaw
+}
+
+function onTrigger(controller){
+  if(state !== STATE.KYP) return;
+  const yaw = getControllerForwardYaw(controller);
+  const target = kypStep===0 ? -Math.PI/2 : (kypStep===1 ? 0 : Math.PI/2); // left / forward / right
+  const diff = Math.abs(THREE.MathUtils.euclideanModulo(yaw-target+Math.PI, Math.PI*2)-Math.PI);
+  if(diff < POINT_THRESHOLD){
+    clickTone();
+    pulseController(controller, 0.4, 60);
+    kypStep++;
+    if(kypStep>=3){
+      enterState(STATE.CROSS);
+    }
+  } else {
+    // wrong direction, gentle buzz, no progress
+    pulseController(controller, 0.2, 40);
+  }
+}
+
+// ---------------- HUD PANEL (in-world canvas texture) ----------------
+let hudCanvas, hudCtx, hudTexture, hudPlane;
+function buildHUDPanel(){
+  hudCanvas = document.createElement('canvas');
+  hudCanvas.width = 1024; hudCanvas.height = 256;
+  hudCtx = hudCanvas.getContext('2d');
+  hudTexture = new THREE.CanvasTexture(hudCanvas);
+  const mat = new THREE.MeshBasicMaterial({ map:hudTexture, transparent:true });
+  hudPlane = new THREE.Mesh(new THREE.PlaneGeometry(2.4,0.6), mat);
+  hudPlane.position.set(0,2.0,-2.2); // relative to rig, attached below
+  rig.add(hudPlane);
+  drawHUD('Walk forward toward the yellow crossing line.');
+}
+function drawHUD(line1, line2=''){
+  hudCtx.clearRect(0,0,hudCanvas.width,hudCanvas.height);
+  hudCtx.fillStyle = 'rgba(10,10,10,0.72)';
+  roundRect(hudCtx,8,8,hudCanvas.width-16,hudCanvas.height-16,24);
+  hudCtx.fillStyle = '#ffffff';
+  hudCtx.font = 'bold 44px Arial';
+  hudCtx.textAlign='center';
+  hudCtx.fillText(line1, hudCanvas.width/2, 110);
+  if(line2){
+    hudCtx.font = '34px Arial';
+    hudCtx.fillStyle = '#ffdd55';
+    hudCtx.fillText(line2, hudCanvas.width/2, 175);
+  }
+  hudTexture.needsUpdate = true;
+  document.getElementById('hudState').textContent = line1 + (line2?(' — '+line2):'');
+}
+function roundRect(ctx,x,y,w,h,r){
+  ctx.beginPath();
+  ctx.moveTo(x+r,y);
+  ctx.arcTo(x+w,y,x+w,y+h,r);
+  ctx.arcTo(x+w,y+h,x,y+h,r);
+  ctx.arcTo(x,y+h,x,y,r);
+  ctx.arcTo(x,y,x+w,y,r);
+  ctx.closePath();
+  ctx.fill();
+}
+
+// ---------------- DESKTOP FALLBACK CONTROLS (for testing before upload) ----------------
+let desktopYaw = 0;
+let pointDir = 1; // 0=left,1=forward,2=right for keys 1/2/3
+function setupDesktopFallback(){
+  window.addEventListener('keydown', (e)=>{
+    if(renderer.xr.isPresenting) return; // ignore when actually in VR
+    if(e.key==='ArrowLeft') desktopYaw -= THREE.MathUtils.degToRad(8);
+    if(e.key==='ArrowRight') desktopYaw += THREE.MathUtils.degToRad(8);
+    camera.rotation.y = desktopYaw;
+    if(e.key==='1') pointDir=0;
+    if(e.key==='2') pointDir=1;
+    if(e.key==='3') pointDir=2;
+    if(e.key==='Enter'){
+      if(state===STATE.KYP){
+        const target = pointDir===0?-Math.PI/2:(pointDir===1?0:Math.PI/2);
+        if(pointDir===kypStep){
+          clickTone(); kypStep++;
+          if(kypStep>=3) enterState(STATE.CROSS);
+        }
+      }
+    }
+  });
+}
+
+// ---------------- STATE MACHINE ----------------
+function enterState(s){
+  state = s; stateTimer = 0;
+  if(s===STATE.APPROACH){
+    lookedLeft=false; lookedRight=false; kypStep=0;
+    rig.position.set(0,1.6,START_Z);
+    forkliftLeft.position.set(-30,0,0);
+    forkliftRight.position.set(30,0,0);
+    drawHUD('Walk forward toward the crossing line.');
+  } else if(s===STATE.CHECK){
+    drawHUD('STOP. Look LEFT, then look RIGHT.', 'Both sides must be checked before crossing.');
+  } else if(s===STATE.KYP){
+    drawHUD('KYP Point & Call:', kypLabels[0]);
+  } else if(s===STATE.CROSS){
+    drawHUD('Clear! Walking across safely…');
+  } else if(s===STATE.SAFE){
+    successChime();
+    drawHUD('Crossing complete — well done!', 'Attempts: '+attempts);
+  } else if(s===STATE.HIT){
+    attempts++;
+    flashRed(5);
+    pulseBoth(1.0, 400);
+    hornBlast();
+    engineRoar();
+    drawHUD('HIT! You were not seen by the forklift.', lastHitSide?('Unchecked side: '+lastHitSide):'Reaction was too slow.');
+  }
+}
+
+function update(dt){
+  stateTimer += dt;
+
+  // head yaw relative to north (+Z)
+  const camQ = new THREE.Quaternion();
+  camera.getWorldQuaternion(camQ);
+  const camFwd = new THREE.Vector3(0,0,-1).applyQuaternion(camQ);
+  const headYaw = Math.atan2(camFwd.x, camFwd.z);
+
+  if(state===STATE.APPROACH){
+    rig.position.z += WALK_SPEED*dt;
+    if(rig.position.z >= CROSS_Z - 2.0){
+      enterState(STATE.CHECK);
+    }
+  }
+  else if(state===STATE.CHECK){
+    if(headYaw < -LOOK_THRESHOLD) lookedLeft = true;
+    if(headYaw > LOOK_THRESHOLD) lookedRight = true;
+
+    let status2 = (lookedLeft?'LEFT ✓ ':'LEFT ✗ ') + (lookedRight?'RIGHT ✓':'RIGHT ✗');
+    drawHUD('STOP. Look LEFT and RIGHT before crossing.', status2 + '   ('+Math.ceil(CHECK_TIME_LIMIT-stateTimer)+'s)');
+
+    if(lookedLeft && lookedRight){
+      enterState(STATE.KYP);
+    } else if(stateTimer > CHECK_TIME_LIMIT){
+      if(!lookedLeft && !lookedRight){ lastHitSide = 'both (no check at all)'; triggerForklift('both'); }
+      else if(!lookedRight){ lastHitSide = 'right'; triggerForklift('right'); }
+      else { lastHitSide = 'left'; triggerForklift('left'); }
+    }
+  }
+  else if(state===STATE.KYP){
+    if(kypStep<3){
+      drawHUD('KYP Point & Call ('+(kypStep+1)+'/3):', kypLabels[kypStep] + '   ('+Math.ceil(KYP_TIME_LIMIT-stateTimer)+'s)');
+    }
+    if(stateTimer > KYP_TIME_LIMIT){
+      lastHitSide = 'KYP not completed in time';
+      triggerForklift(Math.random()<0.5?'left':'right');
+    }
+  }
+  else if(state===STATE.CROSS){
+    rig.position.z += WALK_SPEED*dt;
+    if(rig.position.z >= END_Z){
+      enterState(STATE.SAFE);
+    }
+  }
+  else if(state===STATE.SAFE){
+    if(stateTimer > 4.0) enterState(STATE.APPROACH);
+  }
+  else if(state===STATE.HIT){
+    shakeTime = 0.4;
+    if(stateTimer > 2.5) enterState(STATE.APPROACH);
+  }
+
+  // forklift motion when active
+  animateForklift(forkliftLeft, dt);
+  animateForklift(forkliftRight, dt);
+
+  // camera shake on hit
+  if(shakeTime>0){
+    shakeTime -= dt;
+    rig.position.x = (Math.random()-0.5)*0.08;
+    rig.position.y = 1.6 + (Math.random()-0.5)*0.05;
+  } else {
+    rig.position.x = THREE.MathUtils.lerp(rig.position.x,0,0.1);
+  }
+
+  // beacon blink
+  const blink = (Math.sin(performance.now()*0.02)>0);
+  if(forkliftLeft.userData.beacon) forkliftLeft.userData.beacon.visible = forkliftLeft.userData.active ? blink : false;
+  if(forkliftRight.userData.beacon) forkliftRight.userData.beacon.visible = forkliftRight.userData.active ? blink : false;
+}
+
+function triggerForklift(side){
+  if(side==='left'||side==='both') { forkliftLeft.userData.active = true; forkliftLeft.position.set(-22,0,0); }
+  if(side==='right'||side==='both'){ forkliftRight.userData.active = true; forkliftRight.position.set(22,0,0); }
+  enterState(STATE.HIT);
+}
+
+function animateForklift(fl, dt){
+  if(!fl.userData.active) return;
+  const speed = 14; // fast, frightening approach
+  fl.position.x += fl.userData.dir * speed * dt;
+  fl.lookAt(fl.position.x + fl.userData.dir, 0, 0);
+  // once it passes through and far off screen, deactivate & reset
+  if(Math.abs(fl.position.x) > 32){
+    fl.userData.active = false;
+  }
+}
+
+function animate(){
+  const dt = Math.min(clock.getDelta(), 0.05);
+  update(dt);
+  renderer.render(scene, camera);
+}
+</script>
+</body>
+</html>
